@@ -1,24 +1,60 @@
-use std::net::IpAddr;
- 
+mod cli;
+mod db;
+mod downloader;
+
+use anyhow::Result;
+use clap::Parser;
+use std::sync::Arc;
+use tracing::error;
+
+use crate::cli::Args;
+use crate::db::Db;
+use crate::downloader::Downloader;
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // IPv6 address
-    let local_addr: IpAddr = "2001:bc8:1640:4f72::1".parse()?;
+async fn main() -> Result<()> {
+    let args = Arc::new(Args::parse());
+
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
+
+    // Initialize database
+    let db_path = args.db_path.clone();
+    let parent = db_path.parent().unwrap_or_else(|| std::path::Path::new(""));
     
-    let client = reqwest::Client::builder()
-        .local_address(local_addr)
-        .build()?;
-    
-    let mut cpt = 0;
-    loop {
-        let response = client.get("https://backend.wplace.live/files/s0/tiles/1040/704.png").send().await?;
-        if !response.status().is_success() {
-            println!("{}", response.status().as_str());
-            break;
-        }
-        cpt += 1;
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent)?;
     }
-    println!("calls={}", cpt);
+
+    let abs_path = if db_path.is_absolute() {
+        db_path
+    } else {
+        std::env::current_dir()?.join(&db_path)
+    };
+    
+    let db = Arc::new(Db::init(&abs_path).await?);
+
+    // Initialize clients
+    let mut clients = Vec::new();
+    if args.bind.is_empty() {
+        let client = reqwest::Client::builder()
+            .build()?;
+        clients.push(client);
+    } else {
+        for ip in args.bind.iter() {
+            let client = reqwest::Client::builder()
+                .local_address(*ip)
+                .build()?;
+            clients.push(client);
+        }
+    }
+
+    // Run downloader
+    let downloader = Downloader::new(db, args, clients);
+    if let Err(e) = downloader.run().await {
+        error!("Downloader error: {e}");
+        std::process::exit(1);
+    }
+
     Ok(())
 }
- 

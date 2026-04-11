@@ -1,1 +1,7 @@
+.kilo/
+
 target/
+node_modules/
+
+*.png
+*.db

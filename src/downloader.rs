@@ -3,8 +3,11 @@ use crate::db::Db;
 use anyhow::Result;
 use futures::StreamExt;
 use reqwest::Client;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Instant;
 use tracing::{error, info, warn};
 
 pub struct Downloader {
@@ -12,6 +15,10 @@ pub struct Downloader {
     args: Arc<Args>,
     clients: Vec<Client>,
     next_client_idx: AtomicUsize,
+    head_requests: AtomicUsize,
+    get_requests: AtomicUsize,
+    tiles_downloaded: AtomicUsize,
+    status_codes: Mutex<HashMap<u16, usize>>,
 }
 
 impl Downloader {
@@ -21,6 +28,10 @@ impl Downloader {
             args,
             clients,
             next_client_idx: AtomicUsize::new(0),
+            head_requests: AtomicUsize::new(0),
+            get_requests: AtomicUsize::new(0),
+            tiles_downloaded: AtomicUsize::new(0),
+            status_codes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -29,11 +40,30 @@ impl Downloader {
         &self.clients[idx]
     }
 
+    fn record_status(&self, code: u16) {
+        let mut status_codes = self.status_codes.lock().unwrap();
+        *status_codes.entry(code).or_insert(0) += 1;
+    }
+
+    fn increment_head_requests(&self) {
+        self.head_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_get_requests(&self) {
+        self.get_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_tiles_downloaded(&self) {
+        self.tiles_downloaded.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub async fn run(&self) -> Result<()> {
         let (x_min, x_max) = self.args.x_range.unwrap_or((0, 2048));
         let (y_min, y_max) = self.args.y_range.unwrap_or((0, 2048));
 
         info!("Starting download for X: {} to {}, Y: {} to {}", x_min, x_max, y_min, y_max);
+
+        let start_time = Instant::now();
 
         let tiles = futures::stream::iter((x_min..=x_max).flat_map(|x| {
             (y_min..=y_max).map(move |y| (x, y))
@@ -45,7 +75,22 @@ impl Downloader {
             }
         }).await;
 
-        info!("Download complete.");
+        let elapsed = start_time.elapsed();
+        let status_codes = self.status_codes.lock().unwrap();
+        let status_breakdown: Vec<String> = status_codes
+            .iter()
+            .map(|(code, count)| format!("{}: {}", code, count))
+            .collect();
+
+        info!(
+            "Download complete. Elapsed: {:?}, Head requests: {}, Get requests: {}, Tiles downloaded: {}, Status codes: [{}]",
+            elapsed,
+            self.head_requests.load(Ordering::Relaxed),
+            self.get_requests.load(Ordering::Relaxed),
+            self.tiles_downloaded.load(Ordering::Relaxed),
+            status_breakdown.join(", ")
+        );
+
         Ok(())
     }
 
@@ -59,7 +104,17 @@ impl Downloader {
         let client = self.get_client();
 
         // First, check if the tile has changed using HEAD
-        let head_res = client.head(&url).send().await?;
+        self.increment_head_requests();
+        let head_res = match client.head(&url).send().await {
+            Ok(res) => {
+                self.record_status(res.status().as_u16());
+                res
+            }
+            Err(e) => {
+                self.record_status(0);
+                return Err(e.into());
+            }
+        };
         
         let new_etag = head_res.headers()
             .get("etag")
@@ -79,7 +134,18 @@ impl Downloader {
         }
 
         // If changed or not present, fetch the full image
-        let get_res = client.get(&url).send().await?;
+        self.increment_get_requests();
+        let get_res = match client.get(&url).send().await {
+            Ok(res) => {
+                self.record_status(res.status().as_u16());
+                res
+            }
+            Err(e) => {
+                self.record_status(0);
+                return Err(e.into());
+            }
+        };
+
         if !get_res.status().is_success() {
             warn!("Failed to fetch tile {x}/{y}: {}", get_res.status());
             return Err(anyhow::anyhow!("HTTP error: {}", get_res.status()));
@@ -88,6 +154,7 @@ impl Downloader {
         let data = get_res.bytes().await?.to_vec();
         
         self.db.save_tile(x, y, data, new_etag, new_last_modified).await?;
+        self.increment_tiles_downloaded();
         info!("Saved tile {x}/{y}");
 
         Ok(())

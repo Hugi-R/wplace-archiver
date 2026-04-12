@@ -7,6 +7,14 @@ pub struct TileMetadata {
     pub last_modified: Option<String>,
 }
 
+pub struct TileRecord {
+    pub x: i32,
+    pub y: i32,
+    pub data: Vec<u8>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
 pub struct Db {
     pool: Pool<Sqlite>,
 }
@@ -47,30 +55,27 @@ impl Db {
         Ok(row.map(|(etag, last_modified)| TileMetadata { etag, last_modified }))
     }
 
-    pub async fn save_tile(
-        &self,
-        x: i32,
-        y: i32,
-        data: Vec<u8>,
-        etag: Option<String>,
-        last_modified: Option<String>,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO tiles (x, y, data, etag, last_modified, updated_at)
-             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-             ON CONFLICT(x, y) DO UPDATE SET
-                data = excluded.data,
-                etag = excluded.etag,
-                last_modified = excluded.last_modified,
-                updated_at = excluded.updated_at"
-        )
-        .bind(x)
-        .bind(y)
-        .bind(data)
-        .bind(etag)
-        .bind(last_modified)
-        .execute(&self.pool)
-        .await?;
+    pub async fn save_tiles_batch(&self, tiles: Vec<TileRecord>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for tile in tiles {
+            sqlx::query(
+                "INSERT INTO tiles (x, y, data, etag, last_modified, updated_at)
+                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 ON CONFLICT(x, y) DO UPDATE SET
+                    data = excluded.data,
+                    etag = excluded.etag,
+                    last_modified = excluded.last_modified,
+                    updated_at = excluded.updated_at"
+            )
+            .bind(tile.x)
+            .bind(tile.y)
+            .bind(tile.data)
+            .bind(tile.etag)
+            .bind(tile.last_modified)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
 
         Ok(())
     }

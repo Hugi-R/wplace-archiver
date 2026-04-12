@@ -50,8 +50,8 @@ async fn main() -> Result<()> {
     }
 
     // Run downloader
-    let downloader = Downloader::new(db, args, clients);
-    if let Err(e) = downloader.run().await {
+    let (downloader, rx) = Downloader::new(db, args, clients);
+    if let Err(e) = downloader.run(rx).await {
         error!("Downloader error: {e}");
         std::process::exit(1);
     }

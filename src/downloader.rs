@@ -1,5 +1,5 @@
 use crate::cli::Args;
-use crate::db::Db;
+use crate::db::{Db, TileRecord};
 use anyhow::Result;
 use futures::StreamExt;
 use reqwest::Client;
@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 pub struct Downloader {
@@ -19,11 +20,13 @@ pub struct Downloader {
     get_requests: AtomicUsize,
     tiles_downloaded: AtomicUsize,
     status_codes: Mutex<HashMap<u16, usize>>,
+    tx: mpsc::Sender<TileRecord>,
 }
 
 impl Downloader {
-    pub fn new(db: Arc<Db>, args: Arc<Args>, clients: Vec<Client>) -> Self {
-        Self {
+    pub fn new(db: Arc<Db>, args: Arc<Args>, clients: Vec<Client>) -> (Self, mpsc::Receiver<TileRecord>) {
+        let (tx, rx) = mpsc::channel(1000);
+        (Self {
             db,
             args,
             clients,
@@ -32,7 +35,8 @@ impl Downloader {
             get_requests: AtomicUsize::new(0),
             tiles_downloaded: AtomicUsize::new(0),
             status_codes: Mutex::new(HashMap::new()),
-        }
+            tx,
+        }, rx)
     }
 
     fn get_client(&self) -> &Client {
@@ -57,7 +61,7 @@ impl Downloader {
         self.tiles_downloaded.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(self, mut rx: mpsc::Receiver<TileRecord>) -> Result<()> {
         let (x_min, x_max) = self.args.x_range.unwrap_or((0, 2048));
         let (y_min, y_max) = self.args.y_range.unwrap_or((0, 2048));
 
@@ -65,33 +69,104 @@ impl Downloader {
 
         let start_time = Instant::now();
 
-        let tiles = futures::stream::iter((x_min..=x_max).flat_map(|x| {
+        let downloader = Arc::new(self);
+        let (error_tx, mut error_rx) = mpsc::channel::<anyhow::Error>(1);
+        let db = downloader.db.clone();
+
+        let consumer_handle = tokio::spawn(async move {
+            let mut buffer = Vec::with_capacity(100);
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    res = rx.recv() => {
+                        match res {
+                            Some(tile) => {
+                                buffer.push(tile);
+                                if buffer.len() >= 100 {
+                                    if let Err(e) = db.save_tiles_batch(buffer.drain(..).collect()).await {
+                                        let _ = error_tx.send(e).await;
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                if !buffer.is_empty() {
+                                    if let Err(e) = db.save_tiles_batch(buffer.drain(..).collect()).await {
+                                        let _ = error_tx.send(e).await;
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if !buffer.is_empty() {
+                            if let Err(e) = db.save_tiles_batch(buffer.drain(..).collect()).await {
+                                let _ = error_tx.send(e).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let tiles = futures::stream::iter((x_min..=x_max).flat_map(move |x| {
             (y_min..=y_max).map(move |y| (x, y))
         }));
 
-        tiles.for_each_concurrent(self.args.concurrency, |(x, y)| async move {
-            if let Err(e) = self.download_tile(x, y).await {
-                error!("Error downloading tile {x}/{y}: {e}");
-            }
-        }).await;
+        let downloader_for_loop = downloader.clone();
+        let mut download_task = tokio::spawn(async move {
+            tiles.for_each_concurrent(downloader_for_loop.args.concurrency, |(x, y)| {
+                let d = downloader_for_loop.clone();
+                async move {
+                    if let Err(e) = d.download_tile(x, y).await {
+                        error!("Error downloading tile {x}/{y}: {e}");
+                    }
+                }
+            }).await;
+            Ok::<(), anyhow::Error>(())
+        });
 
-        let elapsed = start_time.elapsed();
-        let status_codes = self.status_codes.lock().unwrap();
-        let status_breakdown: Vec<String> = status_codes
-            .iter()
-            .map(|(code, count)| format!("{}: {}", code, count))
-            .collect();
+        let result = tokio::select! {
+            res = &mut download_task => res.map_err(|e| anyhow::anyhow!("Download task panicked: {e}"))?,
+            Some(e) = error_rx.recv() => {
+                download_task.abort();
+                Err(e)
+            },
+        };
 
-        info!(
-            "Download complete. Elapsed: {:?}, Head requests: {}, Get requests: {}, Tiles downloaded: {}, Status codes: [{}]",
-            elapsed,
-            self.head_requests.load(Ordering::Relaxed),
-            self.get_requests.load(Ordering::Relaxed),
-            self.tiles_downloaded.load(Ordering::Relaxed),
-            status_breakdown.join(", ")
-        );
+        let stats = if result.is_ok() {
+            let elapsed = start_time.elapsed();
+            let status_codes = downloader.status_codes.lock().unwrap();
+            let status_breakdown: Vec<String> = status_codes
+                .iter()
+                .map(|(code, count)| format!("{}: {}", code, count))
+                .collect();
+            
+            Some((
+                elapsed,
+                downloader.head_requests.load(Ordering::Relaxed),
+                downloader.get_requests.load(Ordering::Relaxed),
+                downloader.tiles_downloaded.load(Ordering::Relaxed),
+                status_breakdown.join(", ")
+            ))
+        } else {
+            None
+        };
 
-        Ok(())
+        drop(downloader);
+        let _ = consumer_handle.await;
+
+        if let Some((elapsed, head, get, downloaded, breakdown)) = stats {
+            info!(
+                "Download complete. Elapsed: {:?}, Head requests: {}, Get requests: {}, Tiles downloaded: {}, Status codes: [{}]",
+                elapsed, head, get, downloaded, breakdown
+            );
+        }
+
+        result
     }
 
     async fn download_tile(&self, x: i32, y: i32) -> Result<()> {
@@ -157,9 +232,16 @@ impl Downloader {
 
         let data = get_res.bytes().await?.to_vec();
         
-        self.db.save_tile(x, y, data, new_etag, new_last_modified).await?;
+        self.tx.send(TileRecord {
+            x,
+            y,
+            data,
+            etag: new_etag,
+            last_modified: new_last_modified,
+        }).await.map_err(|e| anyhow::anyhow!("Failed to send tile to channel: {e}"))?;
+
         self.increment_tiles_downloaded();
-        info!("Saved tile {x}/{y}");
+        info!("Queued tile {x}/{y} for saving");
 
         Ok(())
     }

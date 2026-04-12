@@ -5,7 +5,7 @@ mod downloader;
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::cli::Args;
 use crate::db::Db;
@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
             clients.push(client);
         }
     }
+    info!("Initialized {} client(s).", clients.len());
 
     // Run downloader
     let (downloader, rx) = Downloader::new(db, args, clients);

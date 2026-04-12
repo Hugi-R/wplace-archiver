@@ -1,6 +1,7 @@
-use sqlx::{sqlite::SqliteConnectOptions, SqlitePool, Pool, Sqlite};
+use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode}, SqlitePool, Pool, Sqlite};
 use anyhow::Result;
 use std::path::Path;
+use std::time::Duration;
 
 pub struct TileMetadata {
     pub etag: Option<String>,
@@ -23,7 +24,9 @@ impl Db {
     pub async fn init(path: &Path) -> Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(path.to_path_buf())
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(10));
         let pool = SqlitePool::connect_with(options).await?;
 
         sqlx::query(

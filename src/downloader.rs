@@ -102,6 +102,23 @@ impl Downloader {
         );
     }
 
+    fn report_periodic_statistics(&self, elapsed: std::time::Duration) {
+        let status_codes = self.status_codes.lock().unwrap();
+        let status_breakdown: Vec<String> = status_codes
+            .iter()
+            .map(|(code, count)| format!("{}: {}", code, count))
+            .collect();
+
+        info!(
+            "Progress - Elapsed: {:?}, Head requests: {}, Get requests: {}, Tiles downloaded: {}, Status codes: [{}]",
+            elapsed,
+            self.head_requests.load(Ordering::Relaxed),
+            self.get_requests.load(Ordering::Relaxed),
+            self.tiles_downloaded.load(Ordering::Relaxed),
+            status_breakdown.join(", ")
+        );
+    }
+
     async fn run_consumer(
         db: Arc<Db>,
         mut rx: mpsc::Receiver<TileRecord>,
@@ -192,6 +209,16 @@ impl Downloader {
             Self::run_downloader(downloader_clone, x_min, x_max, y_min, y_max).await
         });
 
+        let downloader_for_logger = downloader.clone();
+        let start_time_for_logger = start_time;
+        let logger_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                downloader_for_logger.report_periodic_statistics(start_time_for_logger.elapsed());
+            }
+        });
+
         let result = tokio::select! {
             res = &mut download_task => res.map_err(|e| anyhow::anyhow!("Download task panicked: {e}"))?,
             Some(e) = error_rx.recv() => {
@@ -199,6 +226,8 @@ impl Downloader {
                 Err(e)
             },
         };
+
+        logger_handle.abort();
 
         if result.is_ok() {
             downloader.report_statistics(start_time.elapsed());
@@ -368,7 +397,6 @@ impl Downloader {
             }).await.map_err(|e| anyhow::anyhow!("Failed to send tile to channel: {e}"))?;
 
             self.increment_tiles_downloaded();
-            info!("Queued tile {x}/{y} for saving");
 
             return Ok(());
         }

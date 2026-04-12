@@ -1,7 +1,7 @@
 use crate::cli::Args;
 use crate::db::{Db, TileRecord};
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -130,16 +130,17 @@ impl Downloader {
     ) -> Result<()> {
         let tiles = futures::stream::iter((x_min..=x_max).flat_map(move |x| {
             (y_min..=y_max).map(move |y| (x, y))
-        }));
+        })).map(Ok);
 
-        tiles.for_each_concurrent(downloader.args.concurrency, |(x, y)| {
+        tiles.try_for_each_concurrent(downloader.args.concurrency, |(x, y)| {
             let d = downloader.clone();
             async move {
-                if let Err(e) = d.download_tile(x, y).await {
+                d.download_tile(x, y).await.map_err(|e| {
                     error!("Error downloading tile {x}/{y}: {e}");
-                }
+                    e
+                })
             }
-        }).await;
+        }).await?;
 
         Ok(())
     }
@@ -185,6 +186,56 @@ impl Downloader {
         result
     }
 
+    async fn send_request_with_retry<F>(
+        &self,
+        label: &str,
+        x: i32,
+        y: i32,
+        request_builder_factory: F,
+        attempts: &mut u32,
+        max_attempts: u32,
+        delay: &mut std::time::Duration,
+    ) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        loop {
+            *attempts += 1;
+            let res = match request_builder_factory().send().await {
+                Ok(res) => res,
+                Err(e) => {
+                    self.record_status(0);
+                    return Err(e.into());
+                }
+            };
+
+            let status = res.status();
+            self.record_status(status.as_u16());
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = res.headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs)
+                    .filter(|&d| d > std::time::Duration::from_secs(1));
+
+                let wait_time = retry_after.unwrap_or(*delay);
+                warn!("Received 429 for {label} {x}/{y}. Retrying in {:?} (attempt {}/{})", wait_time, *attempts, max_attempts);
+
+                if *attempts >= max_attempts {
+                    return Err(anyhow::anyhow!("Max retries reached for 429 on {label} {x}/{y}"));
+                }
+
+                tokio::time::sleep(wait_time).await;
+                *delay *= 2;
+                continue;
+            }
+
+            return Ok(res);
+        }
+    }
+
     async fn download_tile(&self, x: i32, y: i32) -> Result<()> {
         let url = self.args.url
             .replace("{x}", &x.to_string())
@@ -194,22 +245,25 @@ impl Downloader {
 
         let client = self.get_client();
 
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let mut delay = std::time::Duration::from_secs(1);
+
         // First, check if the tile has changed using HEAD
         self.increment_head_requests();
-        let head_res = match client.head(&url).send().await {
-            Ok(res) => {
-                let status = res.status();
-                self.record_status(status.as_u16());
-                if status == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(());
-                }
-                res
-            }
-            Err(e) => {
-                self.record_status(0);
-                return Err(e.into());
-            }
-        };
+        let head_res = self.send_request_with_retry(
+            "HEAD",
+            x,
+            y,
+            || client.head(&url),
+            &mut attempts,
+            max_attempts,
+            &mut delay,
+        ).await?;
+
+        if head_res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
         
         let new_etag = head_res.headers()
             .get("etag")
@@ -220,8 +274,8 @@ impl Downloader {
             .get("last-modified")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-
-        if let Some(meta) = existing_metadata {
+        
+        if let Some(ref meta) = existing_metadata {
             if meta.etag == new_etag && meta.last_modified == new_last_modified {
                 // Tile unchanged
                 return Ok(());
@@ -230,16 +284,15 @@ impl Downloader {
 
         // If changed or not present, fetch the full image
         self.increment_get_requests();
-        let get_res = match client.get(&url).send().await {
-            Ok(res) => {
-                self.record_status(res.status().as_u16());
-                res
-            }
-            Err(e) => {
-                self.record_status(0);
-                return Err(e.into());
-            }
-        };
+        let get_res = self.send_request_with_retry(
+            "GET",
+            x,
+            y,
+            || client.get(&url),
+            &mut attempts,
+            max_attempts,
+            &mut delay,
+        ).await?;
 
         if !get_res.status().is_success() {
             warn!("Failed to fetch tile {x}/{y}: {}", get_res.status());

@@ -36,12 +36,31 @@ async fn main() -> Result<()> {
 
     // Initialize clients
     let mut clients = Vec::new();
-    if args.bind.is_empty() {
+    let mut bind_ips = args.bind.clone();
+
+    if let Some(ref bind_file) = args.bind_file {
+        let content = std::fs::read_to_string(bind_file)
+            .map_err(|e| anyhow::anyhow!("Failed to read bind file '{:?}': {}", bind_file, e))?;
+        
+        for (line_idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            
+            let ip = trimmed.parse::<std::net::IpAddr>()
+                .map_err(|_| anyhow::anyhow!("Invalid IP address '{}' in '{:?}' at line {}", trimmed, bind_file, line_idx + 1))?;
+            
+            bind_ips.push(ip);
+        }
+    }
+
+    if bind_ips.is_empty() {
         let client = reqwest::Client::builder()
             .build()?;
         clients.push(client);
     } else {
-        for ip in args.bind.iter() {
+        for ip in bind_ips.iter() {
             let client = reqwest::Client::builder()
                 .local_address(*ip)
                 .build()?;

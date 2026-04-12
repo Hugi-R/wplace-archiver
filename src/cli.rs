@@ -17,6 +17,10 @@ pub struct Args {
     #[arg(long)]
     pub bind: Vec<IpAddr>,
 
+    /// Path to a file containing a list of IP addresses to bind to
+    #[arg(long)]
+    pub bind_file: Option<PathBuf>,
+
     /// Path to the SQLite database file
     #[arg(long, default_value = "tiles.db")]
     pub db_path: PathBuf,

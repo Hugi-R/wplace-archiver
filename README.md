@@ -40,6 +40,12 @@ To use multiple network interfaces for downloading:
 ./target/release/wplace-archiver --bind 192.168.1.10 --bind 192.168.1.11
 ```
 
+Alternatively, you can provide a file containing a list of IP addresses:
+
+```bash
+./target/release/wplace-archiver --bind-file addresses.txt
+```
+
 ## Configuration Options
 
 | Argument | Description | Default |
@@ -47,6 +53,7 @@ To use multiple network interfaces for downloading:
 | `--x-range` | X range in `min-max` format (e.g., `0-100`) | `0-2048` |
 | `--y-range` | Y range in `min-max` format (e.g., `0-100`) | `0-2048` |
 | `--bind` | List of IP addresses to bind clients to | None |
+| `--bind-file` | Path to a file containing a list of IP addresses | None |
 | `--db-path` | Path to the SQLite database file | `tiles.db` |
 | `--concurrency` | Maximum number of concurrent requests | `10` |
 | `--url` | Base URL template (supports `{x}` and `{y}`) | `https://backend.wplace.live/files/s0/tiles/{x}/{y}.png` |

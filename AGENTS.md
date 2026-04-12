@@ -30,5 +30,5 @@ The `wplace-archiver` is a Rust-based command-line tool designed to download and
     - If the tile is unchanged, the process skips to the next tile.
 5. **Download and Save**: If the tile is new or has changed:
     - A `GET` request is performed to download the tile image.
-    - The image data and new metadata are saved into the SQLite database using an `UPSERT` operation.
+    - The image data and new metadata are saved into the SQLite database using batch `UPSERT` operations.
 

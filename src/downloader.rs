@@ -14,7 +14,9 @@ use tracing::{error, info, warn};
 pub struct Downloader {
     db: Arc<Db>,
     args: Arc<Args>,
-    clients: Vec<Client>,
+    clients: Arc<Mutex<HashMap<usize, Client>>>,
+    #[allow(dead_code)] // for now we don't create new clients after initialization, so this is not used
+    client_id_counter: AtomicUsize,
     next_client_idx: AtomicUsize,
     head_requests: AtomicUsize,
     get_requests: AtomicUsize,
@@ -26,10 +28,18 @@ pub struct Downloader {
 impl Downloader {
     pub fn new(db: Arc<Db>, args: Arc<Args>, clients: Vec<Client>) -> (Self, mpsc::Receiver<TileRecord>) {
         let (tx, rx) = mpsc::channel(1000);
+        let client_id_counter = AtomicUsize::new(0);
+        let mut client_map = HashMap::new();
+        for client in clients {
+            let id = client_id_counter.fetch_add(1, Ordering::SeqCst);
+            client_map.insert(id, client);
+        }
+
         (Self {
             db,
             args,
-            clients,
+            clients: Arc::new(Mutex::new(client_map)),
+            client_id_counter,
             next_client_idx: AtomicUsize::new(0),
             head_requests: AtomicUsize::new(0),
             get_requests: AtomicUsize::new(0),
@@ -39,9 +49,23 @@ impl Downloader {
         }, rx)
     }
 
-    fn get_client(&self) -> &Client {
-        let idx = self.next_client_idx.fetch_add(1, Ordering::Relaxed) % self.clients.len();
-        &self.clients[idx]
+    fn get_client(&self) -> (usize, Client) {
+        let clients = self.clients.lock().unwrap();
+        let keys: Vec<usize> = clients.keys().cloned().collect();
+        if keys.is_empty() {
+            panic!("No clients available in the pool!");
+        }
+        let idx = self.next_client_idx.fetch_add(1, Ordering::Relaxed) % keys.len();
+        let client_id = keys[idx];
+        let client = clients.get(&client_id).unwrap().clone();
+        (client_id, client)
+    }
+
+    fn remove_client(&self, client_id: usize) {
+        let mut clients = self.clients.lock().unwrap();
+        if clients.remove(&client_id).is_some() {
+            warn!("Removed client {client_id} from the pool due to network errors");
+        }
     }
 
     fn record_status(&self, code: u16) {
@@ -205,7 +229,7 @@ impl Downloader {
                 Ok(res) => res,
                 Err(e) => {
                     self.record_status(0);
-                    return Err(e.into());
+                        return Err(e.into());
                 }
             };
 
@@ -241,77 +265,112 @@ impl Downloader {
             .replace("{x}", &x.to_string())
             .replace("{y}", &y.to_string());
 
-        let existing_metadata = self.db.get_tile_metadata(x, y).await?;
+        let mut client_retries = 0;
+        const MAX_CLIENT_RETRIES: u32 = 3;
 
-        let client = self.get_client();
+        loop {
+            let (client_id, client) = self.get_client();
 
-        let mut attempts = 0;
-        let max_attempts = 5;
-        let mut delay = std::time::Duration::from_secs(1);
+            let existing_metadata = self.db.get_tile_metadata(x, y).await?;
 
-        // First, check if the tile has changed using HEAD
-        self.increment_head_requests();
-        let head_res = self.send_request_with_retry(
-            "HEAD",
-            x,
-            y,
-            || client.head(&url),
-            &mut attempts,
-            max_attempts,
-            &mut delay,
-        ).await?;
+            let mut attempts = 0;
+            let max_attempts = 5;
+            let mut delay = std::time::Duration::from_secs(1);
 
-        if head_res.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(());
-        }
-        
-        let new_etag = head_res.headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        
-        let new_last_modified = head_res.headers()
-            .get("last-modified")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        
-        if let Some(ref meta) = existing_metadata {
-            if meta.etag == new_etag && meta.last_modified == new_last_modified {
-                // Tile unchanged
+            // First, check if the tile has changed using HEAD
+            self.increment_head_requests();
+            let head_res = match self.send_request_with_retry(
+                "HEAD",
+                x,
+                y,
+                || client.head(&url),
+                &mut attempts,
+                max_attempts,
+                &mut delay,
+            ).await {
+                Ok(res) => res,
+                Err(e) => {
+                    if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
+                        if reqwest_err.is_connect() || reqwest_err.is_timeout() {
+                            self.remove_client(client_id);
+                            client_retries += 1;
+                            if client_retries >= MAX_CLIENT_RETRIES {
+                                return Err(e);
+                            }
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            if head_res.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(());
             }
+            
+            let new_etag = head_res.headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            
+            let new_last_modified = head_res.headers()
+                .get("last-modified")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            
+            if let Some(ref meta) = existing_metadata {
+                if meta.etag == new_etag && meta.last_modified == new_last_modified {
+                    // Tile unchanged
+                    return Ok(());
+                }
+            }
+
+            // If changed or not present, fetch the full image
+            self.increment_get_requests();
+            let get_res = match self.send_request_with_retry(
+                "GET",
+                x,
+                y,
+                || client.get(&url),
+                &mut attempts,
+                max_attempts,
+                &mut delay,
+            ).await {
+                Ok(res) => res,
+                Err(e) => {
+                    if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
+                        if reqwest_err.is_connect() || reqwest_err.is_timeout() {
+                            self.remove_client(client_id);
+                            client_retries += 1;
+                            if client_retries >= MAX_CLIENT_RETRIES {
+                                return Err(e);
+                            }
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            if !get_res.status().is_success() {
+                warn!("Failed to fetch tile {x}/{y}: {}", get_res.status());
+                return Err(anyhow::anyhow!("HTTP error: {}", get_res.status()));
+            }
+
+            let data = get_res.bytes().await?.to_vec();
+            
+            self.tx.send(TileRecord {
+                x,
+                y,
+                data,
+                etag: new_etag,
+                last_modified: new_last_modified,
+            }).await.map_err(|e| anyhow::anyhow!("Failed to send tile to channel: {e}"))?;
+
+            self.increment_tiles_downloaded();
+            info!("Queued tile {x}/{y} for saving");
+
+            return Ok(());
         }
-
-        // If changed or not present, fetch the full image
-        self.increment_get_requests();
-        let get_res = self.send_request_with_retry(
-            "GET",
-            x,
-            y,
-            || client.get(&url),
-            &mut attempts,
-            max_attempts,
-            &mut delay,
-        ).await?;
-
-        if !get_res.status().is_success() {
-            warn!("Failed to fetch tile {x}/{y}: {}", get_res.status());
-            return Err(anyhow::anyhow!("HTTP error: {}", get_res.status()));
-        }
-
-        let data = get_res.bytes().await?.to_vec();
-        
-        self.tx.send(TileRecord {
-            x,
-            y,
-            data,
-            etag: new_etag,
-            last_modified: new_last_modified,
-        }).await.map_err(|e| anyhow::anyhow!("Failed to send tile to channel: {e}"))?;
-
-        self.increment_tiles_downloaded();
-        info!("Queued tile {x}/{y} for saving");
-
-        Ok(())
     }
 }

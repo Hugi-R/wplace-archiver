@@ -107,7 +107,11 @@ impl Downloader {
         self.increment_head_requests();
         let head_res = match client.head(&url).send().await {
             Ok(res) => {
-                self.record_status(res.status().as_u16());
+                let status = res.status();
+                self.record_status(status.as_u16());
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(());
+                }
                 res
             }
             Err(e) => {

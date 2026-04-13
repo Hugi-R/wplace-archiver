@@ -4,17 +4,23 @@ use anyhow::Result;
 use futures::{StreamExt, TryStreamExt};
 use reqwest::Client;
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+pub struct ClientInfo {
+    pub client: Client,
+    pub local_address: Option<std::net::IpAddr>,
+}
 
 pub struct Downloader {
     db: Arc<Db>,
     args: Arc<Args>,
-    clients: Arc<Mutex<HashMap<usize, Client>>>,
+    clients: Arc<Mutex<HashMap<usize, ClientInfo>>>,
     #[allow(dead_code)] // for now we don't create new clients after initialization, so this is not used
     client_id_counter: AtomicUsize,
     next_client_idx: AtomicUsize,
@@ -26,13 +32,13 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(db: Arc<Db>, args: Arc<Args>, clients: Vec<Client>) -> (Self, mpsc::Receiver<TileRecord>) {
+    pub fn new(db: Arc<Db>, args: Arc<Args>, clients: Vec<ClientInfo>) -> (Self, mpsc::Receiver<TileRecord>) {
         let (tx, rx) = mpsc::channel(1000);
         let client_id_counter = AtomicUsize::new(0);
         let mut client_map = HashMap::new();
-        for client in clients {
+        for client_info in clients {
             let id = client_id_counter.fetch_add(1, Ordering::SeqCst);
-            client_map.insert(id, client);
+            client_map.insert(id, client_info);
         }
 
         (Self {
@@ -57,14 +63,34 @@ impl Downloader {
         }
         let idx = self.next_client_idx.fetch_add(1, Ordering::Relaxed) % keys.len();
         let client_id = keys[idx];
-        let client = clients.get(&client_id).unwrap().clone();
+        let client = clients.get(&client_id).unwrap().client.clone();
         (client_id, client)
     }
 
-    fn remove_client(&self, client_id: usize) {
+    fn recreate_client(&self, client_id: usize) {
         let mut clients = self.clients.lock().unwrap();
-        if clients.remove(&client_id).is_some() {
-            warn!("Removed client {client_id} from the pool due to network errors");
+        if let Some(info) = clients.get(&client_id) {
+            let local_address = info.local_address;
+            
+            let new_client_builder = reqwest::Client::builder().timeout(Duration::from_secs(15)).pool_max_idle_per_host(10);
+            let new_client_builder = if let Some(addr) = local_address {
+                new_client_builder.local_address(addr)
+            } else {
+                new_client_builder
+            };
+
+            match new_client_builder.build() {
+                Ok(new_client) => {
+                    if let Some(info) = clients.get_mut(&client_id) {
+                        info.client = new_client;
+                        warn!("Recreated client {client_id} with address {:?}", local_address);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to recreate client {client_id} with address {:?}: {e}. Removing client from pool.", local_address);
+                    clients.remove(&client_id);
+                }
+            }
         }
     }
 
@@ -258,7 +284,14 @@ impl Downloader {
                 Ok(res) => res,
                 Err(e) => {
                     self.record_status(0);
+                    if *attempts >= max_attempts {
                         return Err(e.into());
+                    }
+                    warn!("{label} {x}/{y} connection error: {e}. Retrying (attempt {}/{})", *attempts, max_attempts);
+                    tokio::time::sleep(*delay).await;
+                    *delay = (*delay * 2).min(Duration::from_secs(10));  // Cap backoff at 10s
+                    *attempts += 1;
+                    continue;
                 }
             };
 
@@ -320,14 +353,17 @@ impl Downloader {
                 Ok(res) => res,
                 Err(e) => {
                     if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
-                        if reqwest_err.is_connect() || reqwest_err.is_timeout() {
-                            self.remove_client(client_id);
-                            client_retries += 1;
-                            if client_retries >= MAX_CLIENT_RETRIES {
-                                return Err(e);
-                            }
-                            continue;
+                        
+                        warn!("Network error during HEAD request for tile {x}/{y} with client {client_id}: {reqwest_err}. Try {client_retries}.",);
+                        if let Some(source) = reqwest_err.source() {
+                            warn!("Error source: {source}");
                         }
+                        self.recreate_client(client_id);
+                        client_retries += 1;
+                        if client_retries >= MAX_CLIENT_RETRIES {
+                            return Err(e);
+                        }
+                        continue;
                     }
                     return Err(e);
                 }
@@ -368,14 +404,16 @@ impl Downloader {
                 Ok(res) => res,
                 Err(e) => {
                     if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
-                        if reqwest_err.is_connect() || reqwest_err.is_timeout() {
-                            self.remove_client(client_id);
-                            client_retries += 1;
-                            if client_retries >= MAX_CLIENT_RETRIES {
-                                return Err(e);
-                            }
-                            continue;
+                        warn!("Network error during GET request for tile {x}/{y} with client {client_id}: {reqwest_err}. Try {client_retries}.",);
+                        if let Some(source) = reqwest_err.source() {
+                            warn!("Error source: {source}");
                         }
+                        self.recreate_client(client_id);
+                        client_retries += 1;
+                        if client_retries >= MAX_CLIENT_RETRIES {
+                            return Err(e);
+                        }
+                        continue;
                     }
                     return Err(e);
                 }

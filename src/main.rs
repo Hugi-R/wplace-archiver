@@ -9,7 +9,7 @@ use tracing::{error, info};
 
 use crate::cli::Args;
 use crate::db::Db;
-use crate::downloader::Downloader;
+use crate::downloader::{ClientInfo, Downloader};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,13 +58,19 @@ async fn main() -> Result<()> {
     if bind_ips.is_empty() {
         let client = reqwest::Client::builder()
             .build()?;
-        clients.push(client);
+        clients.push(ClientInfo {
+            client,
+            local_address: None,
+        });
     } else {
         for ip in bind_ips.iter() {
             let client = reqwest::Client::builder()
                 .local_address(*ip)
                 .build()?;
-            clients.push(client);
+            clients.push(ClientInfo {
+                client,
+                local_address: Some(*ip),
+            });
         }
     }
     info!("Initialized {} client(s).", clients.len());

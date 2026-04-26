@@ -24,10 +24,8 @@ pub struct Downloader {
     #[allow(dead_code)] // for now we don't create new clients after initialization, so this is not used
     client_id_counter: AtomicUsize,
     next_client_idx: AtomicUsize,
-    head_requests: AtomicUsize,
-    get_requests: AtomicUsize,
-    tiles_downloaded: AtomicUsize,
-    status_codes: Mutex<HashMap<u16, usize>>,
+    head_status_codes: Mutex<HashMap<u16, usize>>,
+    get_status_codes: Mutex<HashMap<u16, usize>>,
     tx: mpsc::Sender<TileRecord>,
 }
 
@@ -47,10 +45,8 @@ impl Downloader {
             clients: Arc::new(Mutex::new(client_map)),
             client_id_counter,
             next_client_idx: AtomicUsize::new(0),
-            head_requests: AtomicUsize::new(0),
-            get_requests: AtomicUsize::new(0),
-            tiles_downloaded: AtomicUsize::new(0),
-            status_codes: Mutex::new(HashMap::new()),
+            head_status_codes: Mutex::new(HashMap::new()),
+            get_status_codes: Mutex::new(HashMap::new()),
             tx,
         }, rx)
     }
@@ -94,54 +90,53 @@ impl Downloader {
         }
     }
 
-    fn record_status(&self, code: u16) {
-        let mut status_codes = self.status_codes.lock().unwrap();
+    fn record_status(&self, code: u16, label: &str) {
+        let status_codes = if label == "HEAD" {
+            &self.head_status_codes
+        } else {
+            &self.get_status_codes
+        };
+        let mut status_codes = status_codes.lock().unwrap();
         *status_codes.entry(code).or_insert(0) += 1;
     }
 
-    fn increment_head_requests(&self) {
-        self.head_requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn increment_get_requests(&self) {
-        self.get_requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn increment_tiles_downloaded(&self) {
-        self.tiles_downloaded.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn report_statistics(&self, elapsed: std::time::Duration) {
-        let status_codes = self.status_codes.lock().unwrap();
-        let status_breakdown: Vec<String> = status_codes
+        let head_status_codes = self.head_status_codes.lock().unwrap();
+        let head_status_breakdown: Vec<String> = head_status_codes
+            .iter()
+            .map(|(code, count)| format!("{}: {}", code, count))
+            .collect();
+        let get_status_codes = self.get_status_codes.lock().unwrap();
+        let get_status_breakdown: Vec<String> = get_status_codes
             .iter()
             .map(|(code, count)| format!("{}: {}", code, count))
             .collect();
 
         info!(
-            "Download complete. Elapsed: {:?}, Head requests: {}, Get requests: {}, Tiles downloaded: {}, Status codes: [{}]",
+            "Download complete. Elapsed: {:?}, Head Status codes: [{}], Get Status codes: [{}]",
             elapsed,
-            self.head_requests.load(Ordering::Relaxed),
-            self.get_requests.load(Ordering::Relaxed),
-            self.tiles_downloaded.load(Ordering::Relaxed),
-            status_breakdown.join(", ")
+            head_status_breakdown.join(", "),
+            get_status_breakdown.join(", ")
         );
     }
 
     fn report_periodic_statistics(&self, elapsed: std::time::Duration) {
-        let status_codes = self.status_codes.lock().unwrap();
-        let status_breakdown: Vec<String> = status_codes
+        let head_status_codes = self.head_status_codes.lock().unwrap();
+        let head_status_breakdown: Vec<String> = head_status_codes
+            .iter()
+            .map(|(code, count)| format!("{}: {}", code, count))
+            .collect();
+        let get_status_codes = self.get_status_codes.lock().unwrap();
+        let get_status_breakdown: Vec<String> = get_status_codes
             .iter()
             .map(|(code, count)| format!("{}: {}", code, count))
             .collect();
 
         info!(
-            "Progress - Elapsed: {:?}, Head requests: {}, Get requests: {}, Tiles downloaded: {}, Status codes: [{}]",
+            "Progress - Elapsed: {:?}, Head Status codes: [{}], Get Status codes: [{}]",
             elapsed,
-            self.head_requests.load(Ordering::Relaxed),
-            self.get_requests.load(Ordering::Relaxed),
-            self.tiles_downloaded.load(Ordering::Relaxed),
-            status_breakdown.join(", ")
+            head_status_breakdown.join(", "),
+            get_status_breakdown.join(", ")
         );
     }
 
@@ -283,7 +278,7 @@ impl Downloader {
             let res = match request_builder_factory().send().await {
                 Ok(res) => res,
                 Err(e) => {
-                    self.record_status(0);
+                    self.record_status(0, label);
                     if *attempts >= max_attempts {
                         return Err(e.into());
                     }
@@ -296,7 +291,7 @@ impl Downloader {
             };
 
             let status = res.status();
-            self.record_status(status.as_u16());
+            self.record_status(status.as_u16(), label);
 
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 let retry_after = res.headers()
@@ -340,7 +335,6 @@ impl Downloader {
             let mut delay = std::time::Duration::from_secs(1);
 
             // First, check if the tile has changed using HEAD
-            self.increment_head_requests();
             let head_res = match self.send_request_with_retry(
                 "HEAD",
                 x,
@@ -391,7 +385,6 @@ impl Downloader {
             }
 
             // If changed or not present, fetch the full image
-            self.increment_get_requests();
             let get_res = match self.send_request_with_retry(
                 "GET",
                 x,
@@ -433,8 +426,6 @@ impl Downloader {
                 etag: new_etag,
                 last_modified: new_last_modified,
             }).await.map_err(|e| anyhow::anyhow!("Failed to send tile to channel: {e}"))?;
-
-            self.increment_tiles_downloaded();
 
             return Ok(());
         }
